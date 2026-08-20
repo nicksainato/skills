@@ -1,0 +1,86 @@
+{
+  "title": "WhisperKit dictation",
+  "rules": [
+    {
+      "description": "F5: tap to toggle WhisperKit dictation, or hold to talk (recommended).",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "f5",
+            "modifiers": { "optional": ["any"] }
+          },
+          "parameters": {
+            "basic.to_if_held_down_threshold_milliseconds": 250
+          },
+          "to": [
+            {
+              "set_variable": {
+                "name": "whisperkit_dictation_f5_pressed",
+                "value": 1
+              }
+            }
+          ],
+          "to_if_held_down": [
+            { "shell_command": "$HOME/.local/bin/whisperkit-dictate hold-start" }
+          ],
+          "to_after_key_up": [
+            {
+              "set_variable": {
+                "name": "whisperkit_dictation_f5_pressed",
+                "value": 0
+              }
+            },
+            { "shell_command": "$HOME/.local/bin/whisperkit-dictate release" }
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Hold Caps Lock to dictate with WhisperKit. A tap still toggles Caps Lock.",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "caps_lock",
+            "modifiers": { "optional": ["any"] }
+          },
+          "parameters": {
+            "basic.to_if_alone_timeout_milliseconds": 250,
+            "basic.to_if_held_down_threshold_milliseconds": 250
+          },
+          "to_if_alone": [{ "key_code": "caps_lock" }],
+          "to_if_held_down": [
+            { "shell_command": "$HOME/.local/bin/whisperkit-dictate start" }
+          ],
+          "to_after_key_up": [
+            { "shell_command": "$HOME/.local/bin/whisperkit-dictate stop" }
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Hold Right Command to dictate with WhisperKit (alternative to Caps Lock).",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "right_command",
+            "modifiers": { "optional": ["any"] }
+          },
+          "parameters": {
+            "basic.to_if_alone_timeout_milliseconds": 250,
+            "basic.to_if_held_down_threshold_milliseconds": 400
+          },
+          "to": [{ "key_code": "right_command", "lazy": true }],
+          "to_if_held_down": [
+            { "shell_command": "$HOME/.local/bin/whisperkit-dictate start" }
+          ],
+          "to_after_key_up": [
+            { "shell_command": "$HOME/.local/bin/whisperkit-dictate stop" }
+          ]
+        }
+      ]
+    }
+  ]
+}

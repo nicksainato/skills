@@ -1,0 +1,41 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Model weights and caches
+models/
+cache/
+*.safetensors
+*.gguf
+*.ggml
+*.onnx
+*.mlmodelc/
+*.mlpackage/
+*.incomplete
+
+# Local media and generated transcripts
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.m4a
+*.mp3
+*.wav
+*.flac
+*.aac
+out/
+outputs/
+transcripts/
+
+# Secrets and local editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+.idea/
+.vscode/

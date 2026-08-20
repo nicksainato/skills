@@ -1,0 +1,4 @@
+interface:
+  display_name: "WhisperKit Transcription"
+  short_description: "Transcribe media privately on Apple Silicon"
+  default_prompt: "Use $whisperkit to transcribe a local audio or video file on-device."

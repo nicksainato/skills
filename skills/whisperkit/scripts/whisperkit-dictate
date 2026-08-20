@@ -1,0 +1,440 @@
+#!/bin/bash
+# whisperkit-dictate: tap-or-hold dictation with whisperkit-cli.
+#
+#   whisperkit-dictate start   # begin recording the microphone
+#   whisperkit-dictate stop    # end recording, transcribe, copy, paste
+#   whisperkit-dictate status  # show state and server health
+#   whisperkit-dictate serve   # run the warm-model server in the foreground
+#
+# A hotkey tool (Karabiner-Elements) calls start on key down and stop on key up.
+# Audio stays on the machine. Nothing is uploaded.
+
+set -uo pipefail
+
+# Recorded speech is private. $TMPDIR on macOS is a per-user directory with
+# mode 700; /tmp is world readable, so it is not used here.
+STATE_DIR="${WHISPERKIT_DICTATE_DIR:-${TMPDIR:-/tmp}/whisperkit-dictate}"
+WAV="$STATE_DIR/recording.wav"
+PIDFILE="$STATE_DIR/ffmpeg.pid"
+SERVER_PIDFILE="$STATE_DIR/server.pid"
+LISTEN_PIDFILE="$STATE_DIR/listener.pid"
+HOLD_MARKER="$STATE_DIR/key-held"
+LOG="$STATE_DIR/dictate.log"
+
+SERVER="${WHISPERKIT_DICTATE_SERVER:-http://localhost:50060}"
+MODEL="${WHISPERKIT_DICTATE_MODEL:-large-v3-v20240930_turbo}"
+MIC_NAME="${WHISPERKIT_DICTATE_MIC:-MacBook Pro Microphone}"
+MAX_SECONDS="${WHISPERKIT_DICTATE_MAX_SECONDS:-120}"
+PASTE="${WHISPERKIT_DICTATE_PASTE:-1}"
+SOUNDS="${WHISPERKIT_DICTATE_SOUNDS:-1}"
+START_SOUND="${WHISPERKIT_DICTATE_START_SOUND-Purr}"
+# Empty means auto-detect. A fixed language stops Whisper from inventing
+# foreign text when it hears nothing.
+LANGUAGE="${WHISPERKIT_DICTATE_LANGUAGE-en}"
+# Silence gate, based on the peak level. Leading and trailing silence drags
+# the average down, so the average is a bad test. Measured on this machine:
+# room tone peaks at -39 dB, a blocked microphone reads -91 dB, speech peaks
+# at -26 dB or louder.
+MIN_PEAK_DB="${WHISPERKIT_DICTATE_MIN_PEAK_DB:--35}"
+MIN_SECONDS="${WHISPERKIT_DICTATE_MIN_SECONDS:-0.4}"
+
+# Absolute paths matter here: a hotkey runs this with a minimal PATH.
+find_bin() {
+  local name="$1"
+  local found
+  found="$(command -v "$name" 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf '%s' "$found"
+    return 0
+  fi
+  for dir in /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do
+    if [ -x "$dir/$name" ]; then
+      printf '%s' "$dir/$name"
+      return 0
+    fi
+  done
+  printf '%s' "$name"
+}
+
+FFMPEG="${WHISPERKIT_DICTATE_FFMPEG:-$(find_bin ffmpeg)}"
+ENGINE="${WHISPERKIT_DICTATE_ENGINE:-$(find_bin whisperkit-cli)}"
+# Overridable so the tests can run the real code paths without a microphone,
+# the clipboard, or sound.
+CURL="${WHISPERKIT_DICTATE_CURL:-/usr/bin/curl}"
+OSASCRIPT="${WHISPERKIT_DICTATE_OSASCRIPT:-/usr/bin/osascript}"
+PBCOPY="${WHISPERKIT_DICTATE_PBCOPY:-/usr/bin/pbcopy}"
+AFPLAY="${WHISPERKIT_DICTATE_AFPLAY:-/usr/bin/afplay}"
+PYTHON="${WHISPERKIT_DICTATE_PYTHON:-/usr/bin/python3}"
+OPEN="${WHISPERKIT_DICTATE_OPEN:-/usr/bin/open}"
+PASTE_APP="${WHISPERKIT_DICTATE_PASTE_APP:-$HOME/Applications/WhisperKit Paste.app}"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
+
+sound() {
+  [ "$SOUNDS" = "1" ] || return 0
+  "$AFPLAY" -v 0.4 "/System/Library/Sounds/$1.aiff" >/dev/null 2>&1 &
+}
+
+notify() {
+  "$OSASCRIPT" -e "display notification \"$1\" with title \"WhisperKit dictation\"" >/dev/null 2>&1 || true
+}
+
+MIC_PARSER='
+import re, sys
+name = sys.argv[1].strip().lower()
+audio, devices = False, []
+for line in sys.stdin:
+    if "AVFoundation audio devices" in line:
+        audio = True
+        continue
+    if audio:
+        m = re.search(r"\[(\d+)\]\s+(.*?)\s*$", line)
+        if m:
+            devices.append((m.group(1), m.group(2)))
+for index, label in devices:
+    if label.strip().lower() == name:
+        print(index)
+        break
+else:
+    for index, label in devices:
+        if "macbook" in label.lower() or "built-in" in label.lower():
+            print(index)
+            break
+    else:
+        print(devices[0][0] if devices else "0")
+'
+
+mic_index() {
+  "$FFMPEG" -f avfoundation -list_devices true -i "" 2>&1 |
+    "$PYTHON" -c "$MIC_PARSER" "$MIC_NAME"
+}
+
+# A pid file outlives the process it names, and macOS reuses pids. Check that
+# the pid is still the program we started before signalling it.
+live_pid() {
+  local file="$1" want="$2" pid
+  [ -f "$file" ] || return 1
+  pid="$(cat "$file" 2>/dev/null)"
+  [ -n "$pid" ] || { rm -f "$file"; return 1; }
+  case "$pid" in
+    ''|*[!0-9]*) rm -f "$file"; return 1 ;;
+  esac
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$file"
+    return 1
+  fi
+  if ! ps -p "$pid" -o command= 2>/dev/null | grep -q "$want"; then
+    rm -f "$file"
+    return 1
+  fi
+  printf '%s' "$pid"
+}
+
+recording_pid() {
+  live_pid "$PIDFILE" "ffmpeg"
+}
+
+server_up() {
+  "$CURL" -s -m 1 "$SERVER/health" >/dev/null 2>&1
+}
+
+# The server keeps the model in memory, which takes a transcription from
+# about 3 seconds to under 1. It starts on demand and is not a login item.
+ensure_server() {
+  server_up && return 0
+  if live_pid "$SERVER_PIDFILE" "whisperkit-cli" >/dev/null; then
+    return 0
+  fi
+  nohup "$ENGINE" serve --model "$MODEL" >> "$STATE_DIR/serve.log" 2>&1 &
+  echo $! > "$SERVER_PIDFILE"
+  log "server starting (pid $(cat "$SERVER_PIDFILE"))"
+}
+
+cmd_start() {
+  # A hotkey process has no microphone grant. Hand the work to the listener.
+  if [ "$INLINE" != "1" ] && listener_running; then
+    cmd_send start
+    return $?
+  fi
+  if recording_pid >/dev/null; then
+    log "start ignored: already recording"
+    return 0
+  fi
+  ensure_server
+  local index
+  index="$(mic_index)"
+  rm -f "$WAV"
+  "$FFMPEG" -y -loglevel error -f avfoundation -i ":$index" \
+    -t "$MAX_SECONDS" -ac 1 -ar 16000 -c:a pcm_s16le "$WAV" \
+    >> "$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  log "start: mic index $index pid $(cat "$PIDFILE")"
+  [ -z "$START_SOUND" ] || sound "$START_SOUND"
+}
+
+cmd_stop() {
+  if [ "$INLINE" != "1" ] && listener_running; then
+    cmd_send stop
+    return $?
+  fi
+  local pid
+  pid="$(recording_pid)" || { log "stop ignored: not recording"; return 0; }
+  kill -INT "$pid" 2>/dev/null
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill -9 "$pid" 2>/dev/null
+  rm -f "$PIDFILE"
+
+  if [ ! -s "$WAV" ]; then
+    log "stop: no audio captured (microphone permission?)"
+    sound Basso
+    notify "No audio captured. Check microphone permission."
+    return 1
+  fi
+
+  local gate
+  gate="$(silence_gate)"
+  if [ -n "$gate" ]; then
+    log "stop: discarded, $gate"
+    sound Basso
+    return 0
+  fi
+
+  local text
+  text="$(transcribe)"
+  if [ -z "$text" ]; then
+    log "stop: empty transcription"
+    sound Basso
+    notify "Nothing was transcribed."
+    return 1
+  fi
+
+  printf '%s' "$text" | "$PBCOPY"
+  log "stop: ${#text} characters copied"
+  if [ "$PASTE" = "1" ]; then
+    local paste_error
+    if [ ! -d "$PASTE_APP" ]; then
+      log "paste failed: helper is missing at $PASTE_APP"
+      notify "Copied. Install the WhisperKit Paste helper."
+    elif ! paste_error="$("$OPEN" -g -j -n "$PASTE_APP" 2>&1)"; then
+      log "paste failed: ${paste_error:-helper returned an error}"
+      notify "Copied. Enable WhisperKit Paste in Accessibility."
+    fi
+  fi
+  sound Pop
+}
+
+cmd_toggle() {
+  if recording_pid >/dev/null; then
+    cmd_stop
+  else
+    cmd_start
+  fi
+}
+
+# Karabiner calls this only after the key crosses its hold threshold. The
+# marker lets key-up distinguish a hold from a tap without timing races.
+cmd_hold_start() {
+  : > "$HOLD_MARKER"
+  chmod 600 "$HOLD_MARKER" 2>/dev/null || true
+  cmd_start
+}
+
+cmd_release() {
+  if [ -f "$HOLD_MARKER" ]; then
+    rm -f "$HOLD_MARKER"
+    cmd_stop
+  else
+    cmd_toggle
+  fi
+}
+
+GATE_PARSER='
+import re, sys
+min_peak = float(sys.argv[1])
+min_seconds = float(sys.argv[2])
+text = sys.stdin.read()
+peak = re.search(r"max_volume:\s*(-?[\d.]+) dB", text)
+duration = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", text)
+seconds = 0.0
+if duration:
+    h, m, s = duration.groups()
+    seconds = int(h) * 3600 + int(m) * 60 + float(s)
+if seconds < min_seconds:
+    print("too short (%.2fs)" % seconds)
+elif peak and float(peak.group(1)) < min_peak:
+    print("silence (peak %s dB)" % peak.group(1))
+'
+
+silence_gate() {
+  "$FFMPEG" -i "$WAV" -af volumedetect -f null - 2>&1 |
+    "$PYTHON" -c "$GATE_PARSER" "$MIN_PEAK_DB" "$MIN_SECONDS"
+}
+
+transcribe() {
+  # bash 3.2 ships with macOS, and there "${empty[@]}" under set -u aborts the
+  # shell. The +"..." form keeps an empty language setting from killing the
+  # listener.
+  local language_arg=()
+  [ -n "$LANGUAGE" ] && language_arg=(-F "language=$LANGUAGE")
+  local body
+  body="$("$CURL" -s -m 120 -X POST "$SERVER/v1/audio/transcriptions" \
+    -F "file=@$WAV" -F "model=whisper-1" ${language_arg[@]+"${language_arg[@]}"} \
+    -F "response_format=json" 2>/dev/null)"
+  if [ -n "$body" ]; then
+    local text
+    text="$(printf '%s' "$body" | "$PYTHON" -c '
+import json, re, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if data.get("error"):
+    sys.exit(0)
+value = re.sub(r"<\|[^|>]*\|>", " ", str(data.get("text", "")))
+print(" ".join(value.split()))
+')"
+    if [ -n "$text" ]; then
+      printf '%s' "$text"
+      return 0
+    fi
+    log "server call failed, falling back to a cold run"
+  fi
+  # Fallback: no server. Slower, because the model loads every time.
+  local cli_language=()
+  [ -n "$LANGUAGE" ] && cli_language=(--language "$LANGUAGE")
+  "$ENGINE" transcribe --audio-path "$WAV" --model "$MODEL" \
+    ${cli_language[@]+"${cli_language[@]}"} --skip-special-tokens 2>> "$LOG" |
+    "$PYTHON" -c '
+import re, sys
+value = re.sub(r"<\|[^|>]*\|>", " ", sys.stdin.read())
+print(" ".join(value.split()))
+'
+}
+
+# macOS gives a microphone grant to the app that starts the process chain.
+# A command that Karabiner runs has no grant, and macOS returns silent audio
+# instead of an error. So Karabiner only writes a word into this pipe, and the
+# recording happens in this listener, which you start from your terminal.
+CONTROL="$STATE_DIR/control"
+INLINE=0
+
+SEND_PY='
+import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+except OSError:
+    sys.exit(3)
+os.write(fd, (sys.argv[2] + "\n").encode())
+os.close(fd)
+'
+
+cmd_send() {
+  "$PYTHON" -c "$SEND_PY" "$CONTROL" "$1"
+  local code=$?
+  if [ "$code" = "3" ]; then
+    log "send $1 failed: listener is not running"
+    sound Basso
+    notify "Dictation listener is not running. Run: whisperkit-dictate listen"
+  fi
+  return "$code"
+}
+
+cmd_listen() {
+  INLINE=1
+  rm -f "$HOLD_MARKER"
+  # Two listeners on one pipe each read part of every command, and neither
+  # acts on it. Refuse to start a second one.
+  local running
+  running="$(live_pid "$LISTEN_PIDFILE" "whisperkit-dictate")"
+  if [ -n "$running" ]; then
+    echo "A dictation listener is already running (pid $running)." >&2
+    return 1
+  fi
+  if [ -e "$CONTROL" ] && ! [ -p "$CONTROL" ]; then
+    rm -f "$CONTROL"
+  fi
+  [ -p "$CONTROL" ] || mkfifo "$CONTROL"
+  chmod 600 "$CONTROL" 2>/dev/null || true
+  echo $$ > "$LISTEN_PIDFILE"
+  trap 'rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER"; exit 0' INT TERM
+  log "listener: ready on $CONTROL"
+  echo "Dictation listener ready. Hold your dictation key to talk."
+  echo "Close it with: whisperkit-dictate quit"
+  ensure_server
+  # Hold the pipe open for the life of the loop. Reopening it per command
+  # loses any key press that arrives while a transcription is running.
+  exec 3<> "$CONTROL"
+  local line
+  while read -r line <&3; do
+    case "$line" in
+      start) cmd_start ;;
+      stop) cmd_stop ;;
+      quit)
+        log "listener: stopped"
+        rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER"
+        return 0
+        ;;
+      "") ;;
+      *) log "listener: ignored '$line'" ;;
+    esac
+  done
+  rm -f "$LISTEN_PIDFILE"
+}
+
+listener_running() {
+  [ -p "$CONTROL" ] && live_pid "$LISTEN_PIDFILE" "whisperkit-dictate" >/dev/null
+}
+
+cmd_status() {
+  local pid
+  if pid="$(recording_pid)"; then
+    echo "recording: yes (pid $pid)"
+  else
+    echo "recording: no"
+  fi
+  echo "server:    $SERVER $("$CURL" -s -m 2 "$SERVER/health" || echo '(not reachable)')"
+  echo "mic:       $MIC_NAME (index $(mic_index))"
+  if listener_running; then
+    echo "listener:  running"
+  else
+    echo "listener:  NOT running   start it with: whisperkit-dictate listen"
+  fi
+  echo "wav:       $WAV"
+  echo "log:       $LOG"
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  hold-start) cmd_hold_start ;;
+  release) cmd_release ;;
+  listen) cmd_listen ;;
+  send) cmd_send "${2:-}" ;;
+  quit) cmd_send quit ;;
+  toggle) cmd_toggle ;;
+  status) cmd_status ;;
+  serve) exec "$ENGINE" serve --model "$MODEL" ;;
+  stop-server)
+    server_pid="$(live_pid "$SERVER_PIDFILE" "whisperkit-cli")"
+    if [ -n "$server_pid" ]; then
+      kill "$server_pid" 2>/dev/null
+      rm -f "$SERVER_PIDFILE"
+      echo "server stopped"
+    elif pkill -f "whisperkit-cli serve"; then
+      echo "server stopped"
+    else
+      echo "no server running"
+    fi
+    ;;
+  *)
+    echo "usage: whisperkit-dictate {listen|send start|send stop|start|stop|toggle|hold-start|release|status|serve|stop-server|quit}" >&2
+    exit 2
+    ;;
+esac
