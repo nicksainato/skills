@@ -3,7 +3,7 @@
 #
 #   whisperkit-dictate start   # begin recording the microphone
 #   whisperkit-dictate stop    # end recording, transcribe, copy, paste
-#   whisperkit-dictate status  # show state and server health
+#   whisperkit-dictate status  # show state, server, and indicator health
 #   whisperkit-dictate serve   # run the warm-model server in the foreground
 #
 # A hotkey tool (Karabiner-Elements) calls start on key down and stop on key up.
@@ -19,14 +19,21 @@ PIDFILE="$STATE_DIR/ffmpeg.pid"
 SERVER_PIDFILE="$STATE_DIR/server.pid"
 LISTEN_PIDFILE="$STATE_DIR/listener.pid"
 HOLD_MARKER="$STATE_DIR/key-held"
+# Set for the whole life of one utterance, from start until its text is
+# handled. The recorder pid is not enough: ffmpeg exits on its own at the
+# time limit, and that recording still has to be transcribed, not dropped.
+PENDING="$STATE_DIR/pending"
 LOG="$STATE_DIR/dictate.log"
+INDICATOR_STATE="$STATE_DIR/indicator.state"
+INDICATOR_PIDFILE="$STATE_DIR/indicator.pid"
 
 SERVER="${WHISPERKIT_DICTATE_SERVER:-http://localhost:50060}"
 MODEL="${WHISPERKIT_DICTATE_MODEL:-large-v3-v20240930_turbo}"
 MIC_NAME="${WHISPERKIT_DICTATE_MIC:-MacBook Pro Microphone}"
-MAX_SECONDS="${WHISPERKIT_DICTATE_MAX_SECONDS:-120}"
+MAX_SECONDS="${WHISPERKIT_DICTATE_MAX_SECONDS:-900}"
 PASTE="${WHISPERKIT_DICTATE_PASTE:-1}"
 SOUNDS="${WHISPERKIT_DICTATE_SOUNDS:-1}"
+INDICATOR="${WHISPERKIT_DICTATE_INDICATOR:-1}"
 START_SOUND="${WHISPERKIT_DICTATE_START_SOUND-Purr}"
 # Empty means auto-detect. A fixed language stops Whisper from inventing
 # foreign text when it hears nothing.
@@ -65,8 +72,11 @@ OSASCRIPT="${WHISPERKIT_DICTATE_OSASCRIPT:-/usr/bin/osascript}"
 PBCOPY="${WHISPERKIT_DICTATE_PBCOPY:-/usr/bin/pbcopy}"
 AFPLAY="${WHISPERKIT_DICTATE_AFPLAY:-/usr/bin/afplay}"
 PYTHON="${WHISPERKIT_DICTATE_PYTHON:-/usr/bin/python3}"
+# Only the indicator is launched this way. The paste helper is run directly,
+# so macOS attributes its Accessibility grant to the helper and not to `open`.
 OPEN="${WHISPERKIT_DICTATE_OPEN:-/usr/bin/open}"
 PASTE_APP="${WHISPERKIT_DICTATE_PASTE_APP:-$HOME/Applications/WhisperKit Paste.app}"
+INDICATOR_APP="${WHISPERKIT_DICTATE_INDICATOR_APP:-$HOME/Applications/WhisperKit Indicator.app}"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
@@ -80,6 +90,35 @@ sound() {
 
 notify() {
   "$OSASCRIPT" -e "display notification \"$1\" with title \"WhisperKit dictation\"" >/dev/null 2>&1 || true
+}
+
+# Sound alone does not say whether the microphone is still open, so an
+# on-screen pill carries the state. It is a separate app: this script runs
+# from a hotkey and has no window server session of its own to draw in.
+ensure_indicator() {
+  [ "$INDICATOR" = "1" ] || return 0
+  [ -d "$INDICATOR_APP" ] || return 0
+  live_pid "$INDICATOR_PIDFILE" "whisperkit-indicator" >/dev/null && return 0
+  # -g keeps focus where it is. Not -j: that launches the app hidden, and a
+  # hidden app's windows stay ordered out however they are ordered front.
+  # No -n either. A second copy would fight the first over the state file.
+  "$OPEN" -g "$INDICATOR_APP" --args --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+}
+
+# States: recording, transcribing, idle, error:<message>, quit.
+indicator() {
+  [ "$INDICATOR" = "1" ] || return 0
+  # Only start the app for something to show. Launching it to say "quit" or
+  # "idle" would leave a pill process behind after the listener is gone.
+  # Starting the app costs a few forks, so only do it where it matters: the
+  # first state of an utterance, and an error, which is often reported when
+  # nothing else is running at all.
+  case "$1" in
+    recording*|error:*) ensure_indicator ;;
+  esac
+  printf '%s' "$1" > "$INDICATOR_STATE.tmp" 2>/dev/null &&
+    mv -f "$INDICATOR_STATE.tmp" "$INDICATOR_STATE" 2>/dev/null
+  return 0
 }
 
 MIC_PARSER='
@@ -107,9 +146,22 @@ else:
         print(devices[0][0] if devices else "0")
 '
 
+# Enumerating audio devices takes about 230 ms, and it used to run on every
+# start, delaying the microphone by that much. The listener is a long lived
+# process, so the answer is resolved once and kept. A capture that produces
+# nothing clears it, which is what a device index going stale looks like.
+MIC_INDEX=""
+
 mic_index() {
-  "$FFMPEG" -f avfoundation -list_devices true -i "" 2>&1 |
-    "$PYTHON" -c "$MIC_PARSER" "$MIC_NAME"
+  if [ -z "$MIC_INDEX" ]; then
+    MIC_INDEX="$("$FFMPEG" -f avfoundation -list_devices true -i "" 2>&1 |
+      "$PYTHON" -c "$MIC_PARSER" "$MIC_NAME")"
+  fi
+  printf '%s' "$MIC_INDEX"
+}
+
+forget_mic_index() {
+  MIC_INDEX=""
 }
 
 # A pid file outlives the process it names, and macOS reuses pids. Check that
@@ -161,18 +213,39 @@ cmd_start() {
   fi
   if recording_pid >/dev/null; then
     log "start ignored: already recording"
+    ensure_indicator
     return 0
   fi
-  ensure_server
   local index
   index="$(mic_index)"
   rm -f "$WAV"
-  "$FFMPEG" -y -loglevel error -f avfoundation -i ":$index" \
-    -t "$MAX_SECONDS" -ac 1 -ar 16000 -c:a pcm_s16le "$WAV" \
-    >> "$LOG" 2>&1 &
-  echo $! > "$PIDFILE"
-  log "start: mic index $index pid $(cat "$PIDFILE")"
+  : > "$PENDING"
+  local deadline
+  deadline=$(( $(date +%s) + MAX_SECONDS ))
+  log "start: mic index $index, limit ${MAX_SECONDS}s"
+  # ffmpeg runs inside this subshell so the subshell can wait on it. When the
+  # time limit ends the recording, nothing else would notice, and the next key
+  # press used to start over and delete the audio.
+  (
+    "$FFMPEG" -y -loglevel error -f avfoundation -i ":$index" \
+      -t "$MAX_SECONDS" -ac 1 -ar 16000 -c:a pcm_s16le -flush_packets 1 "$WAV" \
+      >> "$LOG" 2>&1 &
+    ffpid=$!
+    echo "$ffpid" > "$PIDFILE"
+    wait "$ffpid"
+    # Finish only this recording. A key press removes both files, and a later
+    # recording replaces the pid, so neither is claimed here.
+    if [ -f "$PENDING" ] &&
+      { [ ! -f "$PIDFILE" ] || [ "$(cat "$PIDFILE" 2>/dev/null)" = "$ffpid" ]; }; then
+      log "recorder ended on its own: transcribing what was captured"
+      cmd_send stop
+    fi
+  ) >> "$LOG" 2>&1 &
+  indicator "recording:$MAX_SECONDS:$deadline"
   [ -z "$START_SOUND" ] || sound "$START_SOUND"
+  # Last, deliberately. The server only matters once there is audio to send,
+  # and its health check can block for up to a second.
+  ensure_server
 }
 
 cmd_stop() {
@@ -180,20 +253,31 @@ cmd_stop() {
     cmd_send stop
     return $?
   fi
+  # Resolved first, and unconditionally: this also drops a pid file left
+  # behind by a recorder that has already gone.
   local pid
-  pid="$(recording_pid)" || { log "stop ignored: not recording"; return 0; }
-  kill -INT "$pid" 2>/dev/null
-  local waited=0
-  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
-    sleep 0.1
-    waited=$((waited + 1))
-  done
-  kill -9 "$pid" 2>/dev/null
+  pid="$(recording_pid)" || pid=""
+  [ -f "$PENDING" ] || { log "stop ignored: not recording"; return 0; }
+  # Cleared before the work, so a key press and the time limit cannot both
+  # claim the same recording and transcribe it twice.
+  rm -f "$PENDING"
+  if [ -n "$pid" ]; then
+    kill -INT "$pid" 2>/dev/null
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    kill -9 "$pid" 2>/dev/null
+  fi
   rm -f "$PIDFILE"
+  indicator transcribing
 
   if [ ! -s "$WAV" ]; then
     log "stop: no audio captured (microphone permission?)"
+    forget_mic_index
     sound Basso
+    indicator "error:No audio captured"
     notify "No audio captured. Check microphone permission."
     return 1
   fi
@@ -202,7 +286,13 @@ cmd_stop() {
   gate="$(silence_gate)"
   if [ -n "$gate" ]; then
     log "stop: discarded, $gate"
+    case "$gate" in
+      # Room tone is about -39 dB. Far below that is not a quiet room, it is a
+      # capture that never reached a microphone.
+      *"-8"[0-9]*|*"-9"[0-9]*) forget_mic_index ;;
+    esac
     sound Basso
+    indicator "error:No speech detected"
     return 0
   fi
 
@@ -211,27 +301,44 @@ cmd_stop() {
   if [ -z "$text" ]; then
     log "stop: empty transcription"
     sound Basso
+    indicator "error:Nothing transcribed"
     notify "Nothing was transcribed."
     return 1
   fi
 
   printf '%s' "$text" | "$PBCOPY"
   log "stop: ${#text} characters copied"
+  local final=idle
   if [ "$PASTE" = "1" ]; then
     local paste_error
-    if [ ! -d "$PASTE_APP" ]; then
+    # An app bundle is launched, never executed. macOS assigns the
+    # Accessibility grant to whatever owns the process chain, so running the
+    # binary directly puts the grant on this shell and prompts for Script
+    # Editor or bash. Launching the bundle keeps it on WhisperKit Paste.
+    if [ -d "$PASTE_APP" ]; then
+      if ! paste_error="$("$OPEN" -g -j -n "$PASTE_APP" 2>&1)"; then
+        log "paste failed: ${paste_error:-helper returned an error}"
+        final="error:Copied, paste was blocked"
+        notify "Copied. Enable WhisperKit Paste in Accessibility."
+      fi
+    elif [ -x "$PASTE_APP" ]; then
+      if ! paste_error="$("$PASTE_APP" 2>&1)"; then
+        log "paste failed: ${paste_error:-helper returned an error}"
+        final="error:Copied, paste was blocked"
+        notify "Copied. Enable WhisperKit Paste in Accessibility."
+      fi
+    else
       log "paste failed: helper is missing at $PASTE_APP"
+      final="error:Copied, paste helper missing"
       notify "Copied. Install the WhisperKit Paste helper."
-    elif ! paste_error="$("$OPEN" -g -j -n "$PASTE_APP" 2>&1)"; then
-      log "paste failed: ${paste_error:-helper returned an error}"
-      notify "Copied. Enable WhisperKit Paste in Accessibility."
     fi
   fi
+  indicator "$final"
   sound Pop
 }
 
 cmd_toggle() {
-  if recording_pid >/dev/null; then
+  if [ -f "$PENDING" ]; then
     cmd_stop
   else
     cmd_start
@@ -284,7 +391,7 @@ transcribe() {
   local language_arg=()
   [ -n "$LANGUAGE" ] && language_arg=(-F "language=$LANGUAGE")
   local body
-  body="$("$CURL" -s -m 120 -X POST "$SERVER/v1/audio/transcriptions" \
+  body="$("$CURL" -s -m 900 -X POST "$SERVER/v1/audio/transcriptions" \
     -F "file=@$WAV" -F "model=whisper-1" ${language_arg[@]+"${language_arg[@]}"} \
     -F "response_format=json" 2>/dev/null)"
   if [ -n "$body" ]; then
@@ -341,6 +448,7 @@ cmd_send() {
   if [ "$code" = "3" ]; then
     log "send $1 failed: listener is not running"
     sound Basso
+    indicator "error:Dictation listener is not running"
     notify "Dictation listener is not running. Run: whisperkit-dictate listen"
   fi
   return "$code"
@@ -348,7 +456,7 @@ cmd_send() {
 
 cmd_listen() {
   INLINE=1
-  rm -f "$HOLD_MARKER"
+  rm -f "$HOLD_MARKER" "$PENDING"
   # Two listeners on one pipe each read part of every command, and neither
   # acts on it. Refuse to start a second one.
   local running
@@ -363,11 +471,12 @@ cmd_listen() {
   [ -p "$CONTROL" ] || mkfifo "$CONTROL"
   chmod 600 "$CONTROL" 2>/dev/null || true
   echo $$ > "$LISTEN_PIDFILE"
-  trap 'rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER"; exit 0' INT TERM
+  trap 'indicator quit; rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER" "$PENDING"; exit 0' INT TERM
   log "listener: ready on $CONTROL"
   echo "Dictation listener ready. Hold your dictation key to talk."
   echo "Close it with: whisperkit-dictate quit"
   ensure_server
+  ensure_indicator
   # Hold the pipe open for the life of the loop. Reopening it per command
   # loses any key press that arrives while a transcription is running.
   exec 3<> "$CONTROL"
@@ -378,7 +487,8 @@ cmd_listen() {
       stop) cmd_stop ;;
       quit)
         log "listener: stopped"
-        rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER"
+        indicator quit
+        rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER" "$PENDING"
         return 0
         ;;
       "") ;;
@@ -395,7 +505,9 @@ listener_running() {
 cmd_status() {
   local pid
   if pid="$(recording_pid)"; then
-    echo "recording: yes (pid $pid)"
+    echo "recording: yes (pid $pid, limit ${MAX_SECONDS}s)"
+  elif [ -f "$PENDING" ]; then
+    echo "recording: ended, not yet transcribed"
   else
     echo "recording: no"
   fi
@@ -405,6 +517,15 @@ cmd_status() {
     echo "listener:  running"
   else
     echo "listener:  NOT running   start it with: whisperkit-dictate listen"
+  fi
+  if [ "$INDICATOR" != "1" ]; then
+    echo "indicator: off (WHISPERKIT_DICTATE_INDICATOR=0)"
+  elif [ ! -d "$INDICATOR_APP" ]; then
+    echo "indicator: not installed at $INDICATOR_APP"
+  elif live_pid "$INDICATOR_PIDFILE" "whisperkit-indicator" >/dev/null; then
+    echo "indicator: running"
+  else
+    echo "indicator: NOT running   it starts with the listener"
   fi
   echo "wav:       $WAV"
   echo "log:       $LOG"
@@ -420,6 +541,7 @@ case "${1:-}" in
   quit) cmd_send quit ;;
   toggle) cmd_toggle ;;
   status) cmd_status ;;
+  indicator) indicator "${2:-idle}" ;;
   serve) exec "$ENGINE" serve --model "$MODEL" ;;
   stop-server)
     server_pid="$(live_pid "$SERVER_PIDFILE" "whisperkit-cli")"
@@ -434,7 +556,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: whisperkit-dictate {listen|send start|send stop|start|stop|toggle|hold-start|release|status|serve|stop-server|quit}" >&2
+    echo "usage: whisperkit-dictate {listen|send start|send stop|start|stop|toggle|hold-start|release|status|indicator STATE|serve|stop-server|quit}" >&2
     exit 2
     ;;
 esac

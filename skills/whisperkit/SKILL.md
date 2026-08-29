@@ -81,7 +81,8 @@ for the sparse prefetch and for `--model-path`.
 
 A person who wants a local dictation key can install
 [references/dictation.md](references/dictation.md). Tap F5 to start/stop or
-hold it momentarily; the text is pasted into the focused field.
+hold it momentarily; the text is pasted into the focused field. A floating
+pill shows whether the microphone is open and metering real audio.
 
 ```bash
 "$SKILL_ROOT/scripts/whisperkit-dictate" status
