@@ -29,7 +29,9 @@ INDICATOR_PIDFILE="$STATE_DIR/indicator.pid"
 
 SERVER="${WHISPERKIT_DICTATE_SERVER:-http://localhost:50060}"
 MODEL="${WHISPERKIT_DICTATE_MODEL:-large-v3-v20240930_turbo}"
-MIC_NAME="${WHISPERKIT_DICTATE_MIC:-MacBook Pro Microphone}"
+# Empty follows the macOS default input. A set name pins that device, and a
+# name that is not connected falls back to the default input.
+MIC_NAME="${WHISPERKIT_DICTATE_MIC-}"
 MAX_SECONDS="${WHISPERKIT_DICTATE_MAX_SECONDS:-900}"
 PASTE="${WHISPERKIT_DICTATE_PASTE:-1}"
 SOUNDS="${WHISPERKIT_DICTATE_SOUNDS:-1}"
@@ -121,11 +123,15 @@ indicator() {
   return 0
 }
 
+# argv: requested name, system default name. Prints "index<TAB>label".
+# Prints nothing when neither name is connected. Never guesses device 0:
+# AVFoundation lists virtual devices first, and those are digital silence.
 MIC_PARSER='
 import re, sys
-name = sys.argv[1].strip().lower()
+requested = sys.argv[1] if len(sys.argv) > 1 else ""
+system = sys.argv[2] if len(sys.argv) > 2 else ""
 audio, devices = False, []
-for line in sys.stdin:
+for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
     if "AVFoundation audio devices" in line:
         audio = True
         continue
@@ -133,35 +139,128 @@ for line in sys.stdin:
         m = re.search(r"\[(\d+)\]\s+(.*?)\s*$", line)
         if m:
             devices.append((m.group(1), m.group(2)))
-for index, label in devices:
-    if label.strip().lower() == name:
-        print(index)
-        break
-else:
+
+def norm(value):
+    return value.strip().lower().replace("\u2019", "\u0027").replace("\u2018", "\u0027")
+
+def find(name):
+    key = norm(name)
+    if not key:
+        return None
+    partial = None
     for index, label in devices:
-        if "macbook" in label.lower() or "built-in" in label.lower():
-            print(index)
+        folded = norm(label)
+        if folded == key:
+            return index, label
+        if (partial is None and len(key) >= 4 and len(folded) >= 4
+                and (key in folded or folded in key)):
+            partial = index, label
+    return partial
+
+chosen = find(requested) or find(system)
+if chosen is None:
+    for index, label in devices:
+        folded = norm(label)
+        if "macbook" in folded or "built-in" in folded:
+            chosen = index, label
             break
-    else:
-        print(devices[0][0] if devices else "0")
+if chosen is None:
+    sys.exit(0)
+sys.stdout.buffer.write((chosen[0] + "\t" + chosen[1]).encode("utf-8"))
 '
 
-# Enumerating audio devices takes about 230 ms, and it used to run on every
-# start, delaying the microphone by that much. The listener is a long lived
-# process, so the answer is resolved once and kept. A capture that produces
-# nothing clears it, which is what a device index going stale looks like.
-MIC_INDEX=""
+# CoreAudio default input. A launchd app often has no LANG, so the name is
+# written as raw UTF-8 and the caller passes it back as an argument.
+SYSTEM_INPUT_PY='
+import ctypes, sys
 
-mic_index() {
-  if [ -z "$MIC_INDEX" ]; then
-    MIC_INDEX="$("$FFMPEG" -f avfoundation -list_devices true -i "" 2>&1 |
-      "$PYTHON" -c "$MIC_PARSER" "$MIC_NAME")"
+def fourcc(text):
+    return int.from_bytes(text.encode("latin1"), "big")
+
+try:
+    core = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+    class AudioObjectPropertyAddress(ctypes.Structure):
+        _fields_ = [
+            ("mSelector", ctypes.c_uint32),
+            ("mScope", ctypes.c_uint32),
+            ("mElement", ctypes.c_uint32),
+        ]
+
+    core.AudioObjectGetPropertyData.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(AudioObjectPropertyAddress),
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    core.AudioObjectGetPropertyData.restype = ctypes.c_int32
+    cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    address = AudioObjectPropertyAddress(fourcc("dIn "), fourcc("glob"), 0)
+    device = ctypes.c_uint32()
+    size = ctypes.c_uint32(ctypes.sizeof(device))
+    if core.AudioObjectGetPropertyData(1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(device)) != 0:
+        sys.exit(0)
+    address.mSelector = fourcc("lnam")
+    name = ctypes.c_void_p()
+    size = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+    if core.AudioObjectGetPropertyData(device.value, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(name)) != 0:
+        sys.exit(0)
+    buf = ctypes.create_string_buffer(1024)
+    ok = cf.CFStringGetCString(name, buf, len(buf), 0x08000100)
+    cf.CFRelease(name)
+    if ok and buf.value:
+        sys.stdout.buffer.write(buf.value)
+except Exception:
+    sys.exit(0)
+'
+
+# Enumerating audio devices takes about 230 ms. The list is cached for the
+# life of the listener. The default input itself is read on every start, so
+# a change in System Settings is picked up without restarting. A capture that
+# hears nothing clears the list, which is what a stale device index looks like.
+DEVICE_LIST=""
+MIC_INDEX=""
+MIC_LABEL=""
+
+load_devices() {
+  DEVICE_LIST="$("$FFMPEG" -f avfoundation -list_devices true -i "" 2>&1 || true)"
+}
+
+# WHISPERKIT_DICTATE_SYSTEM_MIC is a test seam. Unset, the system input comes
+# from CoreAudio.
+resolve_mic() {
+  local system="" resolved=""
+  if [ -n "${WHISPERKIT_DICTATE_SYSTEM_MIC+x}" ]; then
+    system="$WHISPERKIT_DICTATE_SYSTEM_MIC"
+  else
+    system="$(PYTHONIOENCODING=utf-8 "$PYTHON" -c "$SYSTEM_INPUT_PY" 2>/dev/null || true)"
   fi
-  printf '%s' "$MIC_INDEX"
+  [ -n "$DEVICE_LIST" ] || load_devices
+  resolved="$(printf '%s\n' "$DEVICE_LIST" | PYTHONIOENCODING=utf-8 "$PYTHON" -c "$MIC_PARSER" "$MIC_NAME" "$system" || true)"
+  if [ -z "$resolved" ]; then
+    load_devices
+    resolved="$(printf '%s\n' "$DEVICE_LIST" | PYTHONIOENCODING=utf-8 "$PYTHON" -c "$MIC_PARSER" "$MIC_NAME" "$system" || true)"
+  fi
+  if [ -z "$resolved" ]; then
+    MIC_INDEX=""
+    MIC_LABEL=""
+    log "mic: no matching input (requested '${MIC_NAME}', system '${system}')"
+    return 1
+  fi
+  MIC_INDEX="${resolved%%$'\t'*}"
+  MIC_LABEL="${resolved#*$'\t'}"
+  return 0
 }
 
 forget_mic_index() {
+  DEVICE_LIST=""
   MIC_INDEX=""
+  MIC_LABEL=""
 }
 
 # A pid file outlives the process it names, and macOS reuses pids. Check that
@@ -216,13 +315,18 @@ cmd_start() {
     ensure_indicator
     return 0
   fi
-  local index
-  index="$(mic_index)"
+  if ! resolve_mic; then
+    sound Basso
+    indicator "error:System input not found"
+    notify "Could not find the system input microphone."
+    return 1
+  fi
+  local index="$MIC_INDEX"
   rm -f "$WAV"
   : > "$PENDING"
   local deadline
   deadline=$(( $(date +%s) + MAX_SECONDS ))
-  log "start: mic index $index, limit ${MAX_SECONDS}s"
+  log "start: mic $MIC_LABEL (index $index), limit ${MAX_SECONDS}s"
   # ffmpeg runs inside this subshell so the subshell can wait on it. When the
   # time limit ends the recording, nothing else would notice, and the next key
   # press used to start over and delete the audio.
@@ -473,6 +577,11 @@ cmd_listen() {
   echo $$ > "$LISTEN_PIDFILE"
   trap 'indicator quit; rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER" "$PENDING"; exit 0' INT TERM
   log "listener: ready on $CONTROL"
+  if resolve_mic; then
+    log "listener: input $MIC_LABEL (index $MIC_INDEX)"
+  else
+    log "listener: system input not found"
+  fi
   echo "Dictation listener ready. Hold your dictation key to talk."
   echo "Close it with: whisperkit-dictate quit"
   ensure_server
@@ -512,7 +621,11 @@ cmd_status() {
     echo "recording: no"
   fi
   echo "server:    $SERVER $("$CURL" -s -m 2 "$SERVER/health" || echo '(not reachable)')"
-  echo "mic:       $MIC_NAME (index $(mic_index))"
+  if resolve_mic; then
+    echo "mic:       $MIC_LABEL (index $MIC_INDEX)"
+  else
+    echo "mic:       system input not found"
+  fi
   if listener_running; then
     echo "listener:  running"
   else

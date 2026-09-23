@@ -241,7 +241,7 @@ skip the app and call `"$HOME/.local/bin/whisperkit-dictate" toggle`.
 | --- | --- | --- |
 | `WHISPERKIT_DICTATE_PASTE` | `1` | `0` copies without pasting. |
 | `WHISPERKIT_DICTATE_LANGUAGE` | `en` | Empty means auto-detect. |
-| `WHISPERKIT_DICTATE_MIC` | `MacBook Pro Microphone` | Input device name. If the name does not match, the script falls back to any device named "macbook" or "built-in", then to the first device. |
+| `WHISPERKIT_DICTATE_MIC` | system input | Empty uses the current macOS default input. A name pins that device; if that device is absent, the default input is used. A built-in microphone is the last resort. The first device AVFoundation lists is not used merely because it is first. |
 | `WHISPERKIT_DICTATE_MODEL` | `large-v3-v20240930_turbo` | Model variant. |
 | `WHISPERKIT_DICTATE_MAX_SECONDS` | `900` | Hard stop for one recording. At the limit the recording finishes itself: it is transcribed and pasted, not discarded. 16 kHz mono is about 2 MB per minute. |
 | `WHISPERKIT_DICTATE_MIN_PEAK_DB` | `-35` | Below this peak the audio counts as silence. |
@@ -278,7 +278,7 @@ Three things used to sit in front of the microphone, and two of them are gone:
 
 | Step | Cost | Now |
 | --- | --- | --- |
-| Enumerate audio devices (`ffmpeg -list_devices`) | about 230 ms | Resolved once per listener and kept. A capture that hears nothing clears it. |
+| Enumerate audio devices (`ffmpeg -list_devices`) | about 230 ms | The device list is resolved once per listener and kept. The system default input is read again on each start. A capture that hears nothing clears the list. |
 | Health check on the model server | up to 1 s when it is not answering | Moved after the recorder starts. The server is needed to transcribe, not to record. |
 | AVFoundation opens the microphone | about 400 ms | Unavoidable. Low latency ffmpeg flags make no difference; the pill shows amber until it clears. |
 
@@ -305,13 +305,13 @@ per-user and mode 700, because recorded speech is private.
 
 | Log line | Cause |
 | --- | --- |
-| `silence (peak -91.0 dB)` | The recorder has no microphone grant. The listener is not running, or the app was rebuilt. |
+| `silence (peak -91.0 dB)` | The capture is digital silence. The listener is not running, the app was rebuilt and lost its microphone grant, or the system input is a virtual device with nothing playing into it. |
 | `silence (peak -39 dB)` | Real room tone. Nothing was said, or the speaker is too far away. |
 | `no audio captured` | A privacy prompt is waiting, or the microphone is held by another app. |
 | `characters copied` and nothing pasted | Enable WhisperKit Paste—not Bash or Script Editor—in Privacy & Security → Accessibility. The text is on the clipboard. |
 | `send ... failed: listener is not running` | Start the app: `open -a "WhisperKit Dictation"`. The pill says the same thing. |
 | Pill never appears | `whisperkit-dictate status` reports the indicator. It starts with the listener, so restart the Dictation app after rebuilding it. |
-| Pill shows a flat line while you speak | The recorder has no microphone grant, or the wrong input device is selected. This is the `-91 dB` case, caught while you are still talking. An amber dot for a moment at the start is normal; a red dot with flat bars is not. |
+| Pill shows a flat line while you speak | The system input is silent, or the recorder has no microphone grant. Dictation uses the input selected in System Settings. An amber dot for a moment at the start is normal; a red dot with flat bars is not. |
 | The pill bars barely move | The meter maps -50 dBFS to -20 dBFS. A much quieter or louder microphone needs `floorDB` and `ceilingDB` in `whisperkit-indicator.swift` remeasured. |
 | `A dictation listener is already running` | One listener owns the pipe. Two would each read half of every command, so the second is refused. |
 

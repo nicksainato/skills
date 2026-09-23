@@ -498,7 +498,7 @@ class DictationTests(unittest.TestCase):
         for name in set(re.findall(r"\$\{(WHISPERKIT_DICTATE_[A-Z_]+)", script)):
             if name in {"WHISPERKIT_DICTATE_CURL", "WHISPERKIT_DICTATE_PBCOPY",
                         "WHISPERKIT_DICTATE_OSASCRIPT", "WHISPERKIT_DICTATE_AFPLAY",
-                        "WHISPERKIT_DICTATE_PYTHON"}:
+                        "WHISPERKIT_DICTATE_PYTHON", "WHISPERKIT_DICTATE_SYSTEM_MIC"}:
                 continue  # test seams, not user settings
             self.assertIn(name, doc, f"{name} is a setting but is not documented")
         # The peak level is the gate, not the average. Leading silence drags
@@ -602,7 +602,12 @@ echo "stub transcript from the fallback path"
             # Port 1 is closed, so the run takes the offline fallback path.
             WHISPERKIT_DICTATE_SERVER="http://localhost:1",
             WHISPERKIT_DICTATE_PASTE="0",
+            WHISPERKIT_DICTATE_INDICATOR="0",
+            # The real default is the system input. Pin the stub microphone so
+            # these tests do not follow whichever device this machine uses.
+            WHISPERKIT_DICTATE_SYSTEM_MIC="MacBook Pro Microphone",
         )
+        env.pop("WHISPERKIT_DICTATE_MIC", None)
         return env
 
     def _dictate(self, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
@@ -623,6 +628,76 @@ echo "stub transcript from the fallback path"
                 "stub transcript from the fallback path",
                 (work / "clipboard.txt").read_text(encoding="utf-8"),
             )
+
+    def _devices(self, env: dict[str, str], *labels: str) -> None:
+        lines = [
+            "#!/bin/bash",
+            'case "$*" in',
+            "  *list_devices*)",
+            '    echo "[AVFoundation indev @ 0x1] AVFoundation audio devices:" >&2',
+        ]
+        for index, label in enumerate(labels):
+            lines.append(f'    echo "[AVFoundation indev @ 0x1] [{index}] {label}" >&2')
+        lines += [
+            "    exit 1 ;;",
+            "  *volumedetect*)",
+            '    echo "  Duration: 00:00:02.00, bitrate: 256 kb/s" >&2',
+            '    echo "[Parsed_volumedetect_0 @ 0x1] max_volume: -6.0 dB" >&2',
+            "    exit 0 ;;",
+            "esac",
+            'for arg in "$@"; do target="$arg"; done',
+            "printf 'RIFFfake' > \"$target\"",
+            "sleep 30",
+            "",
+        ]
+        path = Path(env["WHISPERKIT_DICTATE_FFMPEG"])
+        path.write_text("\n".join(lines), encoding="utf-8")
+        path.chmod(0o755)
+
+    def test_system_input_is_used_instead_of_the_first_device(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("bash stubs")
+        with tempfile.TemporaryDirectory(prefix="whisperkit-dictate-sysmic-") as tmp:
+            work = Path(tmp)
+            env = self._stub_env(work)
+            env["WHISPERKIT_DICTATE_SYSTEM_MIC"] = "Elgato Wave:3"
+            self._devices(env, "Jump Desktop Audio", "Elgato Wave:3")
+            self.assertEqual(self._dictate(env, "start").returncode, 0)
+            log = (work / "state" / "dictate.log").read_text(encoding="utf-8")
+            self.assertIn("Elgato Wave:3 (index 1)", log)
+            self.assertNotIn("index 0", log)
+            status = self._dictate(env, "status")
+            self.assertIn("mic:       Elgato Wave:3 (index 1)", status.stdout)
+            self._dictate(env, "stop")
+
+    def test_explicit_mic_overrides_the_system_input(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("bash stubs")
+        with tempfile.TemporaryDirectory(prefix="whisperkit-dictate-pinmic-") as tmp:
+            work = Path(tmp)
+            env = self._stub_env(work)
+            env["WHISPERKIT_DICTATE_SYSTEM_MIC"] = "Elgato Wave:3"
+            env["WHISPERKIT_DICTATE_MIC"] = "Anker PowerConf C200"
+            self._devices(env, "Jump Desktop Audio", "Elgato Wave:3", "Anker PowerConf C200")
+            self.assertEqual(self._dictate(env, "start").returncode, 0)
+            log = (work / "state" / "dictate.log").read_text(encoding="utf-8")
+            self.assertIn("Anker PowerConf C200 (index 2)", log)
+            self._dictate(env, "stop")
+
+    def test_missing_system_input_does_not_open_the_first_device(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("bash stubs")
+        with tempfile.TemporaryDirectory(prefix="whisperkit-dictate-nomic-") as tmp:
+            work = Path(tmp)
+            env = self._stub_env(work)
+            env["WHISPERKIT_DICTATE_SYSTEM_MIC"] = "Elgato Wave:3"
+            self._devices(env, "Jump Desktop Audio")
+            result = self._dictate(env, "start")
+            self.assertNotEqual(result.returncode, 0)
+            log = (work / "state" / "dictate.log").read_text(encoding="utf-8")
+            self.assertIn("no matching input", log)
+            self.assertNotIn("start: mic", log)
+            self.assertFalse((work / "state" / "ffmpeg.pid").exists())
 
     def test_release_toggles_while_hold_release_is_momentary(self) -> None:
         if sys.platform == "win32":
