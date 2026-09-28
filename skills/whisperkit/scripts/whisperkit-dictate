@@ -15,6 +15,13 @@ set -uo pipefail
 # mode 700; /tmp is world readable, so it is not used here.
 STATE_DIR="${WHISPERKIT_DICTATE_DIR:-${TMPDIR:-/tmp}/whisperkit-dictate}"
 WAV="$STATE_DIR/recording.wav"
+PARTIAL_DIR="$STATE_DIR/partials"
+PREFETCH_PIDFILE="$STATE_DIR/prefetch.pid"
+# One warm turbo pass of 30s takes a few seconds, so the next piece is done
+# before the speaker reaches it. The overlap is transcribed twice and the
+# repeated words are removed when the pieces are joined.
+CHUNK_SECONDS="30"
+OVERLAP_SECONDS="3"
 PIDFILE="$STATE_DIR/ffmpeg.pid"
 SERVER_PIDFILE="$STATE_DIR/server.pid"
 LISTEN_PIDFILE="$STATE_DIR/listener.pid"
@@ -36,6 +43,9 @@ MAX_SECONDS="${WHISPERKIT_DICTATE_MAX_SECONDS:-900}"
 PASTE="${WHISPERKIT_DICTATE_PASTE:-1}"
 SOUNDS="${WHISPERKIT_DICTATE_SOUNDS:-1}"
 INDICATOR="${WHISPERKIT_DICTATE_INDICATOR:-1}"
+# While a take is still being recorded, transcribe finished 30s pieces so a
+# long one does not all wait until the key is released. 0 waits until stop.
+PREFETCH="${WHISPERKIT_DICTATE_PREFETCH:-1}"
 START_SOUND="${WHISPERKIT_DICTATE_START_SOUND-Purr}"
 # Empty means auto-detect. A fixed language stops Whisper from inventing
 # foreign text when it hears nothing.
@@ -273,10 +283,8 @@ live_pid() {
   case "$pid" in
     ''|*[!0-9]*) rm -f "$file"; return 1 ;;
   esac
-  if ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$file"
-    return 1
-  fi
+  # kill -0 can fail across app coalitions (Toggle cannot signal Dictation)
+  # even when the process is still ours. Do not delete the pid file for that.
   if ! ps -p "$pid" -o command= 2>/dev/null | grep -q "$want"; then
     rm -f "$file"
     return 1
@@ -305,10 +313,13 @@ ensure_server() {
 }
 
 cmd_start() {
-  # A hotkey process has no microphone grant. Hand the work to the listener.
-  if [ "$INLINE" != "1" ] && listener_running; then
-    cmd_send start
-    return $?
+  # A hotkey or mouse launcher has no microphone grant. Always hand the work
+  # to the listener. cmd_send will reopen the Dictation app if it is down.
+  if [ "$INLINE" != "1" ]; then
+    if listener_running || [ "${WHISPERKIT_DICTATE_ALLOW_INLINE:-0}" != "1" ]; then
+      cmd_send start
+      return $?
+    fi
   fi
   if recording_pid >/dev/null; then
     log "start ignored: already recording"
@@ -345,6 +356,7 @@ cmd_start() {
       cmd_send stop
     fi
   ) >> "$LOG" 2>&1 &
+  start_prefetch
   indicator "recording:$MAX_SECONDS:$deadline"
   [ -z "$START_SOUND" ] || sound "$START_SOUND"
   # Last, deliberately. The server only matters once there is audio to send,
@@ -353,9 +365,11 @@ cmd_start() {
 }
 
 cmd_stop() {
-  if [ "$INLINE" != "1" ] && listener_running; then
-    cmd_send stop
-    return $?
+  if [ "$INLINE" != "1" ]; then
+    if listener_running || [ "${WHISPERKIT_DICTATE_ALLOW_INLINE:-0}" != "1" ]; then
+      cmd_send stop
+      return $?
+    fi
   fi
   # Resolved first, and unconditionally: this also drops a pid file left
   # behind by a recorder that has already gone.
@@ -375,6 +389,9 @@ cmd_stop() {
     kill -9 "$pid" 2>/dev/null
   fi
   rm -f "$PIDFILE"
+  # The prefetch loop stops once the pending marker is gone. Wait so its last
+  # finished piece is on disk before the tail is transcribed.
+  wait_prefetch
   indicator transcribing
 
   if [ ! -s "$WAV" ]; then
@@ -488,45 +505,339 @@ silence_gate() {
     "$PYTHON" -c "$GATE_PARSER" "$MIN_PEAK_DB" "$MIN_SECONDS"
 }
 
-transcribe() {
-  # bash 3.2 ships with macOS, and there "${empty[@]}" under set -u aborts the
-  # shell. The +"..." form keeps an empty language setting from killing the
-  # listener.
-  local language_arg=()
-  [ -n "$LANGUAGE" ] && language_arg=(-F "language=$LANGUAGE")
-  local body
-  body="$("$CURL" -s -m 900 -X POST "$SERVER/v1/audio/transcriptions" \
-    -F "file=@$WAV" -F "model=whisper-1" ${language_arg[@]+"${language_arg[@]}"} \
-    -F "response_format=json" 2>/dev/null)"
-  if [ -n "$body" ]; then
-    local text
-    text="$(printf '%s' "$body" | "$PYTHON" -c '
+# A one-word clip is about a second long, and WhisperKit returns no text for
+# it. Those clips are padded up to MIN_CLIP_SECONDS. Longer recordings are
+# not padded. Silence after the last word is cut instead: Whisper decodes
+# that tail as its own segment and ends the message with a stock phrase such
+# as "Продолжение следует...", "thank you", or "merci".
+MIN_CLIP_SECONDS="1.5"
+PREPARE_PY='
+import array, math, os, sys, wave
+path = sys.argv[1]
+min_seconds = float(sys.argv[2])
+margin = 0.30
+threshold_db = -50.0
+tmp = path + ".pad"
+try:
+    with wave.open(path, "rb") as src:
+        params = src.getparams()
+        frames = src.readframes(src.getnframes())
+    if params.sampwidth != 2 or params.nchannels < 1 or params.framerate < 1:
+        sys.exit(0)
+    samples = array.array("h")
+    samples.frombytes(frames)
+    ch = params.nchannels
+    rate = params.framerate
+    hop = max(ch, int(rate * 0.02) * ch)
+    loud = []
+    index = 0
+    for i in range(0, len(samples), hop):
+        chunk = samples[i:i + hop]
+        rms = math.sqrt(sum(x * x for x in chunk) / len(chunk)) if chunk else 0
+        db = 20 * math.log10(rms / 32768) if rms > 0 else -120
+        if db >= threshold_db:
+            loud.append(index)
+        index += 1
+    if not loud:
+        sys.exit(0)
+    margin_frames = int(margin / 0.02)
+    first = max(0, loud[0] - margin_frames)
+    last = min(index, loud[-1] + 1 + margin_frames)
+    kept = samples[first * hop:min(len(samples), last * hop)]
+    min_samples = int(min_seconds * rate) * ch
+    if 0 < len(kept) < min_samples:
+        kept.extend([0] * (min_samples - len(kept)))
+    with wave.open(tmp, "wb") as dst:
+        dst.setparams(params)
+        dst.writeframes(array.array("h", kept).tobytes())
+    os.replace(tmp, path)
+except Exception as exc:
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    print("prepare failed: %s" % exc, file=sys.stderr)
+    sys.exit(1)
+'
+
+prepare_file() {
+  if ! "$PYTHON" -c "$PREPARE_PY" "$1" "$MIN_CLIP_SECONDS" 2>> "$LOG"; then
+    log "prepare failed; transcribing the recording as captured"
+  fi
+}
+
+# argv: 1 to drop a trailing stock outro when earlier text exists.
+PARSE_PY='
 import json, re, sys
+drop_outro = len(sys.argv) > 1 and sys.argv[1] == "1"
 try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-if data.get("error"):
+if not isinstance(data, dict) or data.get("error"):
     sys.exit(0)
-value = re.sub(r"<\|[^|>]*\|>", " ", str(data.get("text", "")))
-print(" ".join(value.split()))
-')"
-    if [ -n "$text" ]; then
-      printf '%s' "$text"
-      return 0
-    fi
-    log "server call failed, falling back to a cold run"
+
+def clean(value):
+    value = re.sub(r"<\|[^|>]*\|>", " ", str(value))
+    return " ".join(value.split())
+
+def norm(value):
+    value = value.lower()
+    value = re.sub(r"[^\w\s]+", "", value, flags=re.UNICODE)
+    return " ".join(value.split())
+
+OUTROS = {
+    "thank you",
+    "thank you for watching",
+    "thanks for watching",
+    "thanks for listening",
+    "merci",
+    "merci beaucoup",
+    "to be continued",
+    "продолжение следует",
+    "subtitles by the amaraorg community",
+}
+
+def mostly_foreign(value):
+    letters = [c for c in value if c.isalpha()]
+    if len(letters) < 4:
+        return False
+    foreign = [c for c in letters if ord(c) > 127]
+    return len(foreign) * 2 >= len(letters)
+
+segments = data.get("segments") or []
+duration = float(data.get("duration") or 0)
+kept = []
+overflow = []
+for seg in segments:
+    text = clean(seg.get("text", ""))
+    if not text:
+        continue
+    end = float(seg.get("end") or 0)
+    if duration and end > duration + 1.0:
+        overflow.append(text)
+        continue
+    kept.append(text)
+if not kept and overflow:
+    kept = overflow
+if not kept:
+    value = clean(data.get("text", ""))
+    if value:
+        kept = [value]
+if drop_outro and len(kept) > 1:
+    last = kept[-1]
+    if norm(last) in OUTROS or mostly_foreign(last):
+        kept = kept[:-1]
+if kept:
+    print(" ".join(kept))
+'
+
+WAV_SECONDS_PY='
+import sys
+path, mode = sys.argv[1], sys.argv[2]
+try:
+    data = open(path, "rb").read()
+except Exception:
+    print("0")
+    sys.exit(0)
+idx = data.find(b"data")
+if idx < 0:
+    print("0")
+    sys.exit(0)
+payload = len(data) - (idx + 8)
+if payload < 2:
+    print("0")
+    sys.exit(0)
+payload -= payload % 2
+# While ffmpeg is still writing, ignore the last quarter second.
+hold = 0 if mode == "final" else 8000
+print("%.3f" % (max(0, payload - hold) / 32000.0))
+'
+
+SLICE_PY='
+import array, sys, wave
+src, dst, start, end = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+data = open(src, "rb").read()
+idx = data.find(b"data")
+if idx < 0:
+    sys.exit(1)
+payload = data[idx + 8:]
+payload = payload[:len(payload) - (len(payload) % 2)]
+samples = array.array("h")
+samples.frombytes(payload)
+rate = 16000
+begin = max(0, int(start * rate))
+stop = len(samples) if end == "-" else min(len(samples), int(float(end) * rate))
+if stop - begin < rate // 5:
+    sys.exit(1)
+out = wave.open(dst, "wb")
+out.setnchannels(1)
+out.setsampwidth(2)
+out.setframerate(rate)
+out.writeframes(samples[begin:stop].tobytes())
+out.close()
+'
+
+MERGE_PY='
+import os, sys
+folder, tail = sys.argv[1], sys.argv[2]
+
+def words(text):
+    return text.split()
+
+def key(word):
+    return "".join(ch.lower() for ch in word if ch.isalnum())
+
+def merge(left, right):
+    lw, rw = words(left), words(right)
+    cut = 0
+    limit = min(16, len(lw), len(rw))
+    for n in range(limit, 0, -1):
+        if [key(w) for w in lw[-n:]] == [key(w) for w in rw[:n]] and any(key(w) for w in lw[-n:]):
+            cut = n
+            break
+    return " ".join(lw + rw[cut:])
+
+parts = []
+for name in sorted(os.listdir(folder)):
+    if len(name) > 4 and name.endswith(".txt") and name[:-4].isdigit():
+        text = open(os.path.join(folder, name), encoding="utf-8").read().strip()
+        if text:
+            parts.append(" ".join(text.split()))
+tail = " ".join(tail.split())
+# A tail that is only a stock outro was silence, not the last thing said.
+outros = {
+    "thank you", "thank you for watching", "thanks for watching",
+    "thanks for listening", "merci", "merci beaucoup", "to be continued",
+    "продолжение следует",
+}
+def norm(value):
+    return " ".join("".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in value).split())
+if tail and parts and norm(tail) in outros:
+    tail = ""
+if tail:
+    parts.append(tail)
+text = ""
+for part in parts:
+    text = part if not text else merge(text, part)
+if text:
+    print(text)
+'
+
+request_text() {
+  local file="$1" drop="${2:-0}"
+  local language_arg=() body text
+  [ -n "$LANGUAGE" ] && language_arg=(-F "language=$LANGUAGE")
+  body="$("$CURL" -s -m 900 -X POST "$SERVER/v1/audio/transcriptions" \
+    -F "file=@$file" -F "model=whisper-1" ${language_arg[@]+"${language_arg[@]}"} \
+    -F "response_format=verbose_json" 2>/dev/null)" || body=""
+  if [ -z "$body" ]; then
+    log "server call failed"
+    return 1
   fi
-  # Fallback: no server. Slower, because the model loads every time.
+  text="$(printf '%s' "$body" | "$PYTHON" -c "$PARSE_PY" "$drop")" || text=""
+  if [ -z "$text" ]; then
+    log "server returned no text"
+    return 1
+  fi
+  printf '%s' "$text"
+}
+
+# Transcribes finished pieces during the recording. One request at a time.
+# The cursor is the next start, rewound by the overlap so a word on the cut
+# is heard again with the following piece.
+prefetch_loop() {
+  local cursor="0" index=0 dur end chunk text
+  mkdir -p "$PARTIAL_DIR"
+  rm -f "$PARTIAL_DIR"/*
+  while [ -f "$PENDING" ]; do
+    dur="$("$PYTHON" -c "$WAV_SECONDS_PY" "$WAV" live 2>/dev/null || echo 0)"
+    if "$PYTHON" -c "import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) + float(sys.argv[3]) else 1)" \
+        "$dur" "$cursor" "$CHUNK_SECONDS"; then
+      end="$("$PYTHON" -c "import sys; print(round(float(sys.argv[1]) + float(sys.argv[2]), 3))" "$cursor" "$CHUNK_SECONDS")"
+      chunk="$PARTIAL_DIR/piece-$index.wav"
+      if "$PYTHON" -c "$SLICE_PY" "$WAV" "$chunk" "$cursor" "$end" 2>> "$LOG"; then
+        if text="$(request_text "$chunk" 0)"; then
+          printf '%s' "$text" > "$PARTIAL_DIR/$index.txt"
+          cursor="$("$PYTHON" -c "import sys; print(round(max(0, float(sys.argv[1]) - float(sys.argv[2])), 3))" "$end" "$OVERLAP_SECONDS")"
+          printf '%s' "$cursor" > "$PARTIAL_DIR/cursor"
+          log "prefetch: through ${end}s (${#text} chars)"
+          index=$((index + 1))
+          continue
+        fi
+      fi
+    fi
+    sleep 0.5
+  done
+}
+
+start_prefetch() {
+  [ "$PREFETCH" = "1" ] || return 0
+  rm -rf "$PARTIAL_DIR"
+  mkdir -p "$PARTIAL_DIR"
+  prefetch_loop >> "$LOG" 2>&1 &
+  echo $! > "$PREFETCH_PIDFILE"
+}
+
+wait_prefetch() {
+  local pid="" i=0
+  [ -f "$PREFETCH_PIDFILE" ] || return 0
+  pid="$(cat "$PREFETCH_PIDFILE" 2>/dev/null || true)"
+  rm -f "$PREFETCH_PIDFILE"
+  [ -n "$pid" ] || return 0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 80 ]; do
+    sleep 0.25
+    i=$((i + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+cold_transcribe() {
   local cli_language=()
   [ -n "$LANGUAGE" ] && cli_language=(--language "$LANGUAGE")
-  "$ENGINE" transcribe --audio-path "$WAV" --model "$MODEL" \
+  "$ENGINE" transcribe --audio-path "$1" --model "$MODEL" \
     ${cli_language[@]+"${cli_language[@]}"} --skip-special-tokens 2>> "$LOG" |
     "$PYTHON" -c '
 import re, sys
 value = re.sub(r"<\|[^|>]*\|>", " ", sys.stdin.read())
 print(" ".join(value.split()))
 '
+}
+
+transcribe_tail() {
+  local cursor tailwav tail
+  cursor="$(cat "$PARTIAL_DIR/cursor" 2>/dev/null || echo 0)"
+  tailwav="$PARTIAL_DIR/tail.wav"
+  if ! "$PYTHON" -c "$SLICE_PY" "$WAV" "$tailwav" "$cursor" - 2>> "$LOG"; then
+    log "prefetch tail was empty"
+    "$PYTHON" -c "$MERGE_PY" "$PARTIAL_DIR" ""
+    return 0
+  fi
+  prepare_file "$tailwav"
+  if tail="$(request_text "$tailwav" 1)"; then
+    "$PYTHON" -c "$MERGE_PY" "$PARTIAL_DIR" "$tail"
+    return 0
+  fi
+  log "prefetch tail failed, transcribing the whole recording"
+  return 1
+}
+
+transcribe() {
+  local text=""
+  if [ -s "$PARTIAL_DIR/cursor" ]; then
+    if text="$(transcribe_tail)" && [ -n "$text" ]; then
+      printf '%s' "$text"
+      return 0
+    fi
+  fi
+  prepare_file "$WAV"
+  if text="$(request_text "$WAV" 1)"; then
+    printf '%s' "$text"
+    return 0
+  fi
+  log "server missed, falling back to a cold run"
+  cold_transcribe "$WAV"
 }
 
 # macOS gives a microphone grant to the app that starts the process chain.
@@ -546,16 +857,35 @@ os.write(fd, (sys.argv[2] + "\n").encode())
 os.close(fd)
 '
 
+ensure_listener_app() {
+  local app="$HOME/Applications/WhisperKit Dictation.app"
+  [ -d "$app" ] || return 1
+  "$OPEN" -g "$app" >/dev/null 2>&1 || true
+}
+
 cmd_send() {
   "$PYTHON" -c "$SEND_PY" "$CONTROL" "$1"
   local code=$?
-  if [ "$code" = "3" ]; then
-    log "send $1 failed: listener is not running"
-    sound Basso
-    indicator "error:Dictation listener is not running"
-    notify "Dictation listener is not running. Run: whisperkit-dictate listen"
+  if [ "$code" != "3" ]; then
+    return "$code"
   fi
-  return "$code"
+  # Toggle and Karabiner have no microphone grant. Bring the listener back
+  # rather than recording in the caller.
+  ensure_listener_app
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 0.2
+    "$PYTHON" -c "$SEND_PY" "$CONTROL" "$1"
+    code=$?
+    if [ "$code" != "3" ]; then
+      return "$code"
+    fi
+  done
+  log "send $1 failed: listener is not running"
+  sound Basso
+  indicator "error:Dictation listener is not running"
+  notify "Dictation listener is not running. Open WhisperKit Dictation."
+  return 3
 }
 
 cmd_listen() {
@@ -594,9 +924,12 @@ cmd_listen() {
     case "$line" in
       start) cmd_start ;;
       stop) cmd_stop ;;
+      toggle) cmd_toggle ;;
       quit)
         log "listener: stopped"
         indicator quit
+        rm -f "$PENDING"
+        wait_prefetch
         rm -f "$LISTEN_PIDFILE" "$CONTROL" "$HOLD_MARKER" "$PENDING"
         return 0
         ;;
@@ -607,8 +940,21 @@ cmd_listen() {
   rm -f "$LISTEN_PIDFILE"
 }
 
+fifo_has_reader() {
+  [ -p "$1" ] || return 1
+  "$PYTHON" -c '
+import os, sys
+try:
+    os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK))
+except OSError:
+    sys.exit(1)
+' "$1"
+}
+
 listener_running() {
-  [ -p "$CONTROL" ] && live_pid "$LISTEN_PIDFILE" "whisperkit-dictate" >/dev/null
+  [ -p "$CONTROL" ] || return 1
+  live_pid "$LISTEN_PIDFILE" "whisperkit-dictate" >/dev/null && return 0
+  fifo_has_reader "$CONTROL"
 }
 
 cmd_status() {

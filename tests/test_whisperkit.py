@@ -9,7 +9,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -498,7 +500,8 @@ class DictationTests(unittest.TestCase):
         for name in set(re.findall(r"\$\{(WHISPERKIT_DICTATE_[A-Z_]+)", script)):
             if name in {"WHISPERKIT_DICTATE_CURL", "WHISPERKIT_DICTATE_PBCOPY",
                         "WHISPERKIT_DICTATE_OSASCRIPT", "WHISPERKIT_DICTATE_AFPLAY",
-                        "WHISPERKIT_DICTATE_PYTHON", "WHISPERKIT_DICTATE_SYSTEM_MIC"}:
+                        "WHISPERKIT_DICTATE_PYTHON", "WHISPERKIT_DICTATE_ALLOW_INLINE",
+                        "WHISPERKIT_DICTATE_SYSTEM_MIC"}:
                 continue  # test seams, not user settings
             self.assertIn(name, doc, f"{name} is a setting but is not documented")
         # The peak level is the gate, not the average. Leading silence drags
@@ -543,6 +546,14 @@ class DictationTests(unittest.TestCase):
         recommended_commands = json.dumps(recommended)
         self.assertIn("whisperkit-dictate hold-start", recommended_commands)
         self.assertIn("whisperkit-dictate release", recommended_commands)
+
+    def test_toggle_app_only_signals_the_listener(self) -> None:
+        toggle = (SKILL / "scripts" / "whisperkit-toggle.swift").read_text(encoding="utf-8")
+        script = self.DICTATE.read_text(encoding="utf-8")
+        self.assertIn('open(control.path, O_WRONLY | O_NONBLOCK)', toggle)
+        self.assertNotIn('["toggle"]', toggle)
+        self.assertNotIn("ffmpeg", toggle.lower())
+        self.assertIn("toggle) cmd_toggle", script)
 
     def test_tap_and_hold_commands_share_the_toggle_state(self) -> None:
         script = self.DICTATE.read_text(encoding="utf-8")
@@ -603,6 +614,9 @@ echo "stub transcript from the fallback path"
             WHISPERKIT_DICTATE_SERVER="http://localhost:1",
             WHISPERKIT_DICTATE_PASTE="0",
             WHISPERKIT_DICTATE_INDICATOR="0",
+            # Tests record in-process. A real hotkey must not: it has no mic grant.
+            WHISPERKIT_DICTATE_ALLOW_INLINE="1",
+            WHISPERKIT_DICTATE_PREFETCH="0",
             # The real default is the system input. Pin the stub microphone so
             # these tests do not follow whichever device this machine uses.
             WHISPERKIT_DICTATE_SYSTEM_MIC="MacBook Pro Microphone",
@@ -654,6 +668,103 @@ echo "stub transcript from the fallback path"
         path.write_text("\n".join(lines), encoding="utf-8")
         path.chmod(0o755)
 
+    def test_short_recording_is_padded_before_transcription(self) -> None:
+        """A one-word take is about a second. WhisperKit returns empty text unless silence follows it."""
+        if sys.platform == "win32":
+            self.skipTest("bash stubs")
+        with tempfile.TemporaryDirectory(prefix="whisperkit-dictate-pad-") as tmp:
+            work = Path(tmp)
+            env = self._stub_env(work)
+            ffmpeg = Path(env["WHISPERKIT_DICTATE_FFMPEG"])
+            ffmpeg.write_text(
+                """#!/bin/bash
+case "$*" in
+  *list_devices*)
+    echo "[AVFoundation indev @ 0x1] AVFoundation audio devices:" >&2
+    echo "[AVFoundation indev @ 0x1] [0] MacBook Pro Microphone" >&2
+    exit 1 ;;
+  *volumedetect*)
+    echo "  Duration: 00:00:00.40, bitrate: 256 kb/s" >&2
+    echo "[Parsed_volumedetect_0 @ 0x1] max_volume: -6.0 dB" >&2
+    exit 0 ;;
+esac
+for arg in "$@"; do target="$arg"; done
+python3 - "$target" << 'PY'
+import sys, wave
+path = sys.argv[1]
+with wave.open(path, "wb") as dst:
+    dst.setnchannels(1)
+    dst.setsampwidth(2)
+    dst.setframerate(16000)
+    dst.writeframes(b"\\x00\\x10" * 6400)
+PY
+sleep 30
+""",
+                encoding="utf-8",
+            )
+            ffmpeg.chmod(0o755)
+            self.assertEqual(self._dictate(env, "start").returncode, 0)
+            recorded = work / "state" / "recording.wav"
+            for _ in range(50):
+                if recorded.exists() and recorded.stat().st_size > 1000:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(self._dictate(env, "stop").returncode, 0)
+            with wave.open(str(recorded)) as src:
+                seconds = src.getnframes() / src.getframerate()
+            self.assertGreater(seconds, 1.4)
+            self.assertLess(seconds, 1.7)
+
+    def test_long_recording_is_not_given_a_silence_tail(self) -> None:
+        """Silence after speech is what Whisper turns into a stock outro."""
+        if sys.platform == "win32":
+            self.skipTest("bash stubs")
+        with tempfile.TemporaryDirectory(prefix="whisperkit-dictate-nopad-") as tmp:
+            work = Path(tmp)
+            env = self._stub_env(work)
+            ffmpeg = Path(env["WHISPERKIT_DICTATE_FFMPEG"])
+            ffmpeg.write_text(
+                """#!/bin/bash
+case "$*" in
+  *list_devices*)
+    echo "[AVFoundation indev @ 0x1] AVFoundation audio devices:" >&2
+    echo "[AVFoundation indev @ 0x1] [0] MacBook Pro Microphone" >&2
+    exit 1 ;;
+  *volumedetect*)
+    echo "  Duration: 00:00:03.00, bitrate: 256 kb/s" >&2
+    echo "[Parsed_volumedetect_0 @ 0x1] max_volume: -6.0 dB" >&2
+    exit 0 ;;
+esac
+for arg in "$@"; do target="$arg"; done
+python3 - "$target" << 'PY'
+import sys, wave
+path = sys.argv[1]
+with wave.open(path, "wb") as dst:
+    dst.setnchannels(1)
+    dst.setsampwidth(2)
+    dst.setframerate(16000)
+    dst.writeframes(b"\\x00\\x10" * 48000)
+    dst.writeframes(b"\\x00\\x00" * 24000)
+PY
+sleep 30
+""",
+                encoding="utf-8",
+            )
+            ffmpeg.chmod(0o755)
+            self.assertEqual(self._dictate(env, "start").returncode, 0)
+            recorded = work / "state" / "recording.wav"
+            for _ in range(50):
+                if recorded.exists() and recorded.stat().st_size > 1000:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(self._dictate(env, "stop").returncode, 0)
+            with wave.open(str(recorded)) as src:
+                seconds = src.getnframes() / src.getframerate()
+            # 3s of tone plus 1.5s of zeros. The zeros must not survive, and
+            # nothing further is appended.
+            self.assertGreater(seconds, 2.9)
+            self.assertLess(seconds, 3.5)
+
     def test_system_input_is_used_instead_of_the_first_device(self) -> None:
         if sys.platform == "win32":
             self.skipTest("bash stubs")
@@ -697,6 +808,21 @@ echo "stub transcript from the fallback path"
             log = (work / "state" / "dictate.log").read_text(encoding="utf-8")
             self.assertIn("no matching input", log)
             self.assertNotIn("start: mic", log)
+            self.assertFalse((work / "state" / "ffmpeg.pid").exists())
+
+    def test_start_without_listener_is_refused(self) -> None:
+        """A mouse launcher has no mic grant. Do not fall back to recording in it."""
+        if sys.platform == "win32":
+            self.skipTest("bash stubs")
+        with tempfile.TemporaryDirectory(prefix="whisperkit-dictate-nolisten-") as tmp:
+            work = Path(tmp)
+            env = self._stub_env(work)
+            env["WHISPERKIT_DICTATE_ALLOW_INLINE"] = "0"
+            env["WHISPERKIT_DICTATE_OPEN"] = str(Path(env["WHISPERKIT_DICTATE_OSASCRIPT"]))
+            result = self._dictate(env, "start")
+            self.assertNotEqual(result.returncode, 0)
+            log = (work / "state" / "dictate.log").read_text(encoding="utf-8")
+            self.assertIn("listener is not running", log)
             self.assertFalse((work / "state" / "ffmpeg.pid").exists())
 
     def test_release_toggles_while_hold_release_is_momentary(self) -> None:

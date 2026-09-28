@@ -248,6 +248,7 @@ skip the app and call `"$HOME/.local/bin/whisperkit-dictate" toggle`.
 | `WHISPERKIT_DICTATE_MIN_SECONDS` | `0.4` | Shorter recordings are discarded. |
 | `WHISPERKIT_DICTATE_SOUNDS` | `1` | `0` turns off all success, failure, and optional start sounds. |
 | `WHISPERKIT_DICTATE_INDICATOR` | `1` | `0` never shows the on-screen pill. |
+| `WHISPERKIT_DICTATE_PREFETCH` | `1` | `0` waits until the key is released before transcribing. `1` transcribes each finished 30 seconds while the recording is still going, so a long take only waits on its last piece. |
 | `WHISPERKIT_DICTATE_INDICATOR_APP` | `~/Applications/WhisperKit Indicator.app` | Path to the pill app. If it is missing, dictation runs without it. |
 | `WHISPERKIT_DICTATE_START_SOUND` | `Purr` | Filename from `/System/Library/Sounds`, without `.aiff`. Set it empty for silent start. |
 | `WHISPERKIT_DICTATE_SERVER` | `http://localhost:50060` | Change it if port 50060 is taken. |
@@ -296,6 +297,22 @@ touching the clipboard.
 Measured on one M-series MacBook Pro: blocked microphone -91 dB, room tone
 -39 dB, normal speech -26 dB or louder. Use the peak, not the average.
 Leading and trailing silence drags the average below a speaking voice.
+
+Silence after the last word is removed before transcription. Whisper decodes
+that tail as a segment of its own and finishes the message with a stock
+phrase such as `Продолжение следует...`, `thank you`, or `merci`. A clip
+shorter than 1.5 seconds is padded up to 1.5 seconds, because WhisperKit
+otherwise returns no text for a one-word take. A longer recording is not
+padded. A segment whose end runs past the audio is dropped. So is a final
+segment that is only one of those stock phrases, or that is in another
+script than the rest of an English take. A message that is itself "thank
+you" is kept.
+
+On a long take the listener transcribes each finished 30 seconds while you
+are still talking, keeping 3 seconds of overlap so a word on the cut is not
+lost. Releasing the key only has to transcribe the last piece. The model is
+still the fast turbo model. A smaller model would be a little quicker and
+would invent these endings more often.
 
 ## Troubleshooting
 
